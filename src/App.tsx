@@ -1,60 +1,474 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Check, Copy, Play } from "lucide-react";
 
+type Language = "rust" | "ruby" | "ocaml" | "python" | "lisp";
 type Layer = "unified" | "code" | "lifetimes" | "types" | "invariants" | "performance";
-type LayerDefinition = { id: Layer; label: string; file: string };
+type ProgramViews = Record<Layer, string[]>;
 
-const layers: LayerDefinition[] = [
-  { id: "unified", label: "Unified", file: "foo.unified.rs" },
-  { id: "code", label: "Code", file: "foo.rs" },
-  { id: "lifetimes", label: "Lifetimes", file: "foo.lifetimes.rs" },
-  { id: "types", label: "Types", file: "foo.types.rs" },
-  { id: "invariants", label: "Invariants", file: "foo.invariants.rs" },
-  { id: "performance", label: "Performance", file: "foo.performance.rs" },
+const languages: { id: Language; label: string; extension: string }[] = [
+  { id: "rust", label: "Rust-like", extension: "rs" },
+  { id: "ruby", label: "Ruby-like", extension: "rb" },
+  { id: "ocaml", label: "OCaml-like", extension: "ml" },
+  { id: "python", label: "Python-like", extension: "py" },
+  { id: "lisp", label: "Lisp-like", extension: "lisp" },
 ];
 
-const sourceForCopy = `fn rank<'query, 'docs>(\n    query: &'query str,\n    docs: &'docs [Document],\n) -> impl Iterator<Item = &'docs Document> + 'query + 'docs {\n    let candidates: std::slice::Iter<'docs, Document> = docs.iter();\n    candidates.filter(move |doc: &&'docs Document| doc.title().contains(query))\n}`;
+const layerDefinitions: { id: Layer; label: string; stem: string }[] = [
+  { id: "unified", label: "Unified", stem: "foo.unified" },
+  { id: "code", label: "Logic", stem: "foo" },
+  { id: "lifetimes", label: "Lifetimes", stem: "foo.lifetimes" },
+  { id: "types", label: "Types", stem: "foo.types" },
+  { id: "invariants", label: "Invariants", stem: "foo.invariants" },
+  { id: "performance", label: "Performance", stem: "foo.performance" },
+];
 
-function lineCount(layer: Layer) {
-  if (layer === "unified") return 29;
-  if (layer === "code") return 4;
-  if (layer === "lifetimes") return 7;
-  if (layer === "types") return 6;
-  if (layer === "invariants") return 14;
-  return 14;
+const lines = (source: string) => source.trim().split("\n");
+
+const programs: Record<Language, ProgramViews> = {
+  rust: {
+    unified: lines(`
+#[perf(inline(rank) = auto, heap_allocations = 0, evaluation = lazy)]
+#[perf(materialize = false, padding(candidates) = none, copies_per_item = 0)]
+type Predicate<'query, 'docs> = FnMut(&&'docs Document) -> bool + 'query;
+fn rank<'query, 'docs>(
+    immutable query: &'query str,
+    docs: &'docs [Document],
+) -> impl Iterator<Item = &'docs Document> + 'query + 'docs
+ensures {
+    arity(rank) = 2;
+    result ⊆ docs;
+    matches_all(result, query);
+    preserves_order(result, docs);
+    value_after(query) = value_before(query);
+}
+{
+    let candidates: Iter<'docs, Document> = docs.iter();
+    invariant {
+        count(candidates) = count(docs);
+        order(candidates) = order(docs);
+        elements(candidates) ⊆ docs;
+    };
+    let matching: Filter<
+        Iter<'docs, Document>,
+        Predicate<'query, 'docs>
+    > = candidates.filter(move |doc: &&'docs Document| -> bool {
+        doc.title().contains(query)
+    });
+    matching
+}`),
+    code: lines(`
+fn rank(query, docs) {
+    let candidates = docs.iter();
+    candidates.filter(|doc| doc.title().contains(query))
+}`),
+    lifetimes: lines(`
+fn rank<'query, 'docs>(
+    query: &'query str,
+    docs: &'docs [Document],
+) -> impl Iterator<Item = &'docs Document> + 'query + 'docs {
+    let candidates: Iter<'docs, Document> = docs.iter();
+    candidates.filter(move |doc: &&'docs Document| doc.title().contains(query))
+}`),
+    types: lines(`
+type DocumentRef = &Document
+fn rank(query: &str, docs: &[Document]) -> Iterator<DocumentRef>
+let candidates: Iter<DocumentRef> = iter(docs)
+let predicate: DocumentRef → bool = matches_title(query)
+let matching: Filter<Iter<DocumentRef>, Fn<DocumentRef, bool>> = filter(candidates, predicate)
+return matching`),
+    invariants: lines(`
+invariant rank {
+    arity(rank) == 2
+    result(rank, query, docs) ⊆ docs
+    ∀ doc ∈ result: matches(doc.title, query)
+    order(result) = order(docs filtered by query)
+}
+invariant query {
+    immutable(query)
+    value_after(rank, query) = value_before(rank, query)
+}
+invariant candidates {
+    count(candidates) = count(docs) ∧ order(candidates) = order(docs)
+    elements(candidates) ⊆ docs
+}`),
+    performance: lines(`
+plan rank {
+    inline(rank) = auto
+    return = lazy_iterator
+    heap_allocations = 0
+}
+plan candidates {
+    representation = slice_iterator
+    copies_per_item = 0
+    padding(candidates) = none
+}
+plan matching {
+    evaluation = on_consume
+    materialize = false
+}`),
+  },
+  ruby: {
+    unified: lines(`
+perf :rank, inline: :auto, heap_allocations: 0, evaluation: :lazy
+perf :rank, materialize: false, copies_per_item: 0
+perf :candidates, representation: :slice_enumerator, padding: :none
+type Predicate = Proc[Borrowed[Document, :docs], Bool] captures: :query
+def rank(
+  immutable query: Borrowed[String, :query],
+  docs: Borrowed[List[Document], :docs]
+) -> Iterator[Borrowed[Document, :docs], captures: :query]
+ensures :rank do
+  arity(:rank) == 2
+  result.subset_of?(docs)
+  result.all? { |doc| doc.title.include?(query) }
+  result.order == docs.select { |doc| doc.title.include?(query) }.order
+  query.after(:rank) == query.before(:rank)
+end
+candidates = docs.each
+invariant :candidates do
+  candidates.count == docs.count
+  candidates.order == docs.order
+  candidates.all? { |doc| docs.include?(doc) }
+end
+matching: Filter[Enumerator[Borrowed[Document, :docs]], Predicate] = candidates.select do |doc|
+  doc.title.include?(query)
+end
+matching
+end`),
+    code: lines(`
+def rank(query, docs)
+  candidates = docs.each
+  candidates.select { |doc| doc.title.include?(query) }
+end`),
+    lifetimes: lines(`
+def rank(query: Borrowed[String, :query], docs: Borrowed[List[Document], :docs])
+  -> Iterator[Borrowed[Document, :docs], captures: :query]
+  candidates = docs.each
+  candidates.select { |doc: Borrowed[Document, :docs]| doc.title.include?(query) }
+end`),
+    types: lines(`
+DocumentRef = Borrowed[Document]
+def rank(query: StringRef, docs: Slice[Document]) -> Iterator[DocumentRef]
+candidates: Enumerator[DocumentRef] = docs.each
+predicate: Proc[DocumentRef, Bool] = matches_title(query)
+matching: Select[Enumerator[DocumentRef], predicate] = candidates.select(predicate)
+return matching`),
+    invariants: lines(`
+invariant :rank do
+  arity(:rank) == 2
+  result(:rank, query, docs).subset_of?(docs)
+  result.all? { |doc| doc.title.include?(query) }
+  result.order == docs.select { |doc| doc.title.include?(query) }.order
+end
+invariant :query do
+  immutable(:query)
+  query.after(:rank) == query.before(:rank)
+end
+invariant :candidates do
+  candidates.count == docs.count
+  candidates.order == docs.order
+  candidates.all? { |doc| docs.include?(doc) }
+end`),
+    performance: lines(`
+performance :rank do
+  inline :auto
+  heap_allocations 0
+  evaluation :lazy
+  materialize false
+end
+performance :candidates do
+  representation :slice_enumerator
+  copies_per_item 0
+  padding :none
+end
+performance :matching do
+  evaluation :on_consume
+  materialize false
+end`),
+  },
+  ocaml: {
+    unified: lines(`
+[@@@perf inline(rank) = auto]
+[@@@perf heap_allocations(rank) = 0; evaluation(rank) = lazy]
+[@@@perf materialize(rank) = false; padding(candidates) = none; copies_per_item = 0]
+type ('query, 'docs) predicate = Document ref<'docs> -> bool captures 'query
+val rank :
+  immutable query: string ref<'query> ->
+  docs: Document list ref<'docs> ->
+  Document seq<'docs> captures 'query
+ensures rank:
+  arity rank = 2
+  result rank query docs ⊆ docs
+  matches_all result query
+  preserves_order result docs
+  value_after query = value_before query
+let rank query docs =
+  let candidates : Document seq<'docs> = Seq.of_list docs in
+  invariant candidates:
+    length candidates = length docs
+    order candidates = order docs
+    elements candidates ⊆ docs
+  let matching : Filter[Document seq<'docs>, predicate<'query, 'docs>] =
+    Seq.filter (fun (doc : Document ref<'docs>) -> contains doc.title query) candidates in
+  matching`),
+    code: lines(`
+let rank query docs =
+  let candidates = List.to_seq docs in
+  Seq.filter (fun doc -> contains doc.title query) candidates`),
+    lifetimes: lines(`
+type ('query, 'docs) predicate = Document ref<'docs> -> bool captures 'query
+val rank :
+  immutable query: string ref<'query> ->
+  docs: Document list ref<'docs> ->
+  Document seq<'docs> captures 'query
+let candidates : Document seq<'docs> = Seq.of_list docs
+Seq.filter (fun (doc : Document ref<'docs>) -> contains doc.title query) candidates`),
+    types: lines(`
+type document_ref = Document ref
+val rank : string ref -> Document list ref -> document_ref Seq.t
+let candidates : document_ref Seq.t = Seq.of_list docs
+let predicate : document_ref -> bool = matches_title query
+let matching : document_ref Seq.t = Seq.filter predicate candidates
+matching`),
+    invariants: lines(`
+invariant rank =
+  arity rank = 2
+  result rank query docs ⊆ docs
+  ∀ doc ∈ result: contains doc.title query
+  ordered result = filtered_order docs query
+invariant query =
+  immutable query
+  value_after rank query = value_before rank query
+invariant candidates =
+  length candidates = length docs
+  order candidates = order docs
+  elements candidates ⊆ docs`),
+    performance: lines(`
+[@@perf inline(rank) = auto]
+[@@perf heap_allocations(rank) = 0]
+[@@perf evaluation(rank) = lazy]
+[@@perf materialize(rank) = false]
+[@@perf padding(candidates) = none]
+[@@perf copies_per_item = 0]
+[@@perf representation(candidates) = slice_iterator]
+[@@perf evaluation(matching) = on_consume]`),
+  },
+  python: {
+    unified: lines(`
+@perf(inline=auto, heap_allocations=0, evaluation="lazy")
+@perf(materialize=False, copies_per_item=0, padding={"candidates": None})
+Predicate: TypeAlias = Callable[[Borrowed[Document, 'docs]], bool], captures='query
+def rank(
+    immutable query: Borrowed[str, 'query],
+    docs: Borrowed[list[Document], 'docs],
+) -> Iterator[Borrowed[Document, 'docs], captures=('query, 'docs)]:
+    ensures(
+        arity(rank) == 2,
+        result <= docs,
+        matches_all(result, query),
+        preserves_order(result, docs),
+        value_after(query) == value_before(query),
+    )
+    candidates: Iterator[Borrowed[Document, 'docs]] = iter(docs)
+    invariant(
+        len(candidates) == len(docs),
+        order(candidates) == order(docs),
+        elements(candidates) <= docs,
+    )
+    matching: Filter[Iterator[Borrowed[Document, 'docs]], Predicate] = filter(
+        lambda doc: doc.title.contains(query), candidates
+    )
+    return matching`),
+    code: lines(`
+def rank(query, docs):
+    candidates = iter(docs)
+    return (doc for doc in candidates if query in doc.title)`),
+    lifetimes: lines(`
+Predicate = Callable[[Borrowed[Document, 'docs]], bool], captures='query
+def rank(
+    immutable query: Borrowed[str, 'query],
+    docs: Borrowed[list[Document], 'docs],
+) -> Iterator[Borrowed[Document, 'docs], captures='query]:
+    candidates: Iterator[Borrowed[Document, 'docs]] = iter(docs)
+    return filter(lambda doc: query in doc.title, candidates)`),
+    types: lines(`
+DocumentRef = Ref[Document]
+def rank(query: str, docs: Sequence[Document]) -> Iterator[DocumentRef]:
+candidates: Iterator[DocumentRef] = iter(docs)
+predicate: Callable[[DocumentRef], bool] = matches_title(query)
+matching: Filter[Iterator[DocumentRef], Predicate] = filter(predicate, candidates)
+return matching`),
+    invariants: lines(`
+invariant rank:
+    assert arity(rank) == 2
+    assert result(rank, query, docs) <= docs
+    assert all(matches(doc.title, query) for doc in result)
+    assert preserves_order(result, docs)
+invariant query:
+    assert immutable(query)
+    assert value_after(rank, query) == value_before(rank, query)
+invariant candidates:
+    assert len(candidates) == len(docs)
+    assert order(candidates) == order(docs)
+    assert elements(candidates) <= docs`),
+    performance: lines(`
+@perf(inline="auto")
+@perf(heap_allocations=0)
+@perf(evaluation="lazy")
+@perf(materialize=False)
+@perf(padding={"candidates": None})
+@perf(copies_per_item=0)
+@perf(representation="slice_iterator")
+@perf(evaluation_of="matching", timing="on_consume")`),
+  },
+  lisp: {
+    unified: lines(`
+(perf rank :inline :auto :heap-allocations 0 :evaluation :lazy)
+(perf rank :materialize false :copies-per-item 0 :padding (candidates :none))
+(type Predicate ('query 'docs)
+  (fn ((borrowed Document 'docs)) Bool)
+  (captures 'query))
+(define (rank
+  (immutable query (borrowed String 'query))
+  (docs (borrowed (List Document) 'docs)))
+  (returns (Iterator (borrowed Document 'docs) :captures ('query 'docs)))
+  (ensures
+    (= (arity rank) 2)
+    (subset? result docs)
+    (matches-all? result query)
+    (preserves-order? result docs)
+    (= (value-after query) (value-before query)))
+  (let ((candidates (iter docs :type (Iter 'docs Document))))
+    (invariant candidates
+      (= (count candidates) (count docs))
+      (= (order candidates) (order docs))
+      (subset? (elements candidates) docs))
+    (let ((matching
+      (filter candidates
+        (lambda ((doc (borrowed Document 'docs)))
+          (contains? (title doc) query)))))
+      matching)))`),
+    code: lines(`
+(defun rank (query docs)
+  (let ((candidates (iter docs)))
+    (filter (lambda (doc) (contains? (title doc) query)) candidates)))`),
+    lifetimes: lines(`
+(type Predicate ('query 'docs)
+  (fn ((borrowed Document 'docs)) Bool)
+  (captures 'query))
+(define (rank
+  (immutable query (borrowed String 'query))
+  (docs (borrowed (List Document) 'docs)))
+  (returns (Iterator (borrowed Document 'docs) :captures ('query 'docs)))
+  (let ((candidates (iter docs :type (Iter 'docs Document))))
+    (filter
+      (lambda ((doc (borrowed Document 'docs)))
+        (contains? (title doc) query))
+      candidates)))`),
+    types: lines(`
+(type DocumentRef (Ref Document))
+(fn-type rank (-> ((query StringRef) (docs (Slice Document))) (Iterator DocumentRef)))
+(let ((candidates (Iter DocumentRef) (iter docs)))
+  (let ((predicate (Fn DocumentRef Bool) (matches-title query)))
+    (let ((matching (Filter (Iter DocumentRef) Predicate) (filter candidates predicate)))
+      matching)))`),
+    invariants: lines(`
+(invariant rank
+  (= (arity rank) 2)
+  (subset? (result rank query docs) docs)
+  (forall (doc (result rank query docs))
+    (matches? (title doc) query))
+  (preserves-order? (result rank query docs) docs))
+(invariant query
+  (immutable query)
+  (= (value-after query rank) (value-before query rank)))
+(invariant candidates
+  (= (count candidates) (count docs))
+  (= (order candidates) (order docs))
+  (subset? (elements candidates) docs))`),
+    performance: lines(`
+(perf rank
+  (inline auto)
+  (heap-allocations 0)
+  (evaluation lazy)
+  (materialize false))
+(perf candidates
+  (representation slice-iterator)
+  (copies-per-item 0)
+  (padding none))
+(perf matching
+  (evaluation on-consume)
+  (materialize false))`),
+  },
+};
+
+const keywords: Record<Language, Set<string>> = {
+  rust: new Set(["fn", "let", "type", "impl", "move", "invariant", "ensures", "immutable", "return", "plan"]),
+  ruby: new Set(["def", "end", "do", "type", "invariant", "performance", "perf", "immutable"]),
+  ocaml: new Set(["let", "in", "type", "val", "fun", "immutable", "invariant", "ensures"]),
+  python: new Set(["def", "return", "in", "for", "if", "type", "invariant", "assert", "immutable", "ensures"]),
+  lisp: new Set(["define", "defun", "let", "type", "invariant", "perf", "immutable", "lambda", "returns", "ensures"]),
+};
+
+function classForToken(token: string, language: Language) {
+  if (token.startsWith("#") || token.startsWith("@")) return "syntax-attribute";
+  if (/^'[A-Za-z_][\w]*$/.test(token)) return "syntax-lifetime";
+  if (/^\d+$/.test(token)) return "syntax-number";
+  if (keywords[language].has(token)) return "syntax-keyword";
+  if (/^[A-Z][A-Za-z\d_]*$/.test(token)) return "syntax-type";
+  if (["rank", "title", "iter", "filter", "select", "matches_title", "contains", "Seq", "List"].includes(token)) return "syntax-method";
+  if (["query", "docs", "doc"].includes(token)) return "syntax-parameter";
+  if (["candidates", "matching", "result", "predicate"].includes(token)) return "syntax-variable";
+  if (["inline", "heap_allocations", "evaluation", "materialize", "padding", "copies_per_item", "representation", "arity", "order", "count", "elements", "immutable", "preserves_order", "matches_all", "value_after", "value_before"].includes(token)) return "syntax-property";
+  return "";
 }
 
-function languageFor(layer: Layer) {
-  if (layer === "unified") return "Unified surface";
-  if (layer === "invariants") return "Invariant DSL";
-  if (layer === "performance") return "Performance DSL";
-  if (layer === "types") return "Type projection";
-  return "Rust";
+function highlight(source: string, language: Language) {
+  const tokenPattern = /('[A-Za-z_][\w]*|#[A-Za-z_][\w-]*|@[A-Za-z_][\w]*|[A-Za-z_][\w?!-]*|\d+|"[^"\\]*(?:\\.[^"\\]*)*"|->|=>|::|<=|>=|==|!=|&&|\|\||[{}()[\],.:;=<>|&+*!-])/g;
+  const rendered: ReactNode[] = [];
+  let lastIndex = 0;
+  for (const match of source.matchAll(tokenPattern)) {
+    const token = match[0];
+    const index = match.index ?? 0;
+    if (index > lastIndex) rendered.push(source.slice(lastIndex, index));
+    const className = classForToken(token, language);
+    rendered.push(className ? <span className={className} key={index}>{token}</span> : token);
+    lastIndex = index + token.length;
+  }
+  if (lastIndex < source.length) rendered.push(source.slice(lastIndex));
+  return rendered;
 }
 
 export default function App() {
+  const [language, setLanguage] = useState<Language>("rust");
   const [layer, setLayer] = useState<Layer>("unified");
   const [selectedLine, setSelectedLine] = useState(1);
   const [tracing, setTracing] = useState(false);
   const [copied, setCopied] = useState(false);
 
+  const visibleLines = programs[language][layer];
+
   useEffect(() => {
     if (!tracing) return;
-    const lastLine = lineCount(layer);
     const timer = window.setInterval(() => {
-      setSelectedLine((current) => current >= lastLine ? 1 : current + 1);
+      setSelectedLine((current) => current >= visibleLines.length ? 1 : current + 1);
     }, 900);
     return () => window.clearInterval(timer);
-  }, [layer, tracing]);
+  }, [layer, language, tracing, visibleLines.length]);
+
+  function changeLanguage(nextLanguage: Language) {
+    setLanguage(nextLanguage);
+    setSelectedLine(1);
+  }
 
   function selectLayer(nextLayer: Layer) {
     setLayer(nextLayer);
     setSelectedLine(1);
   }
 
-  async function copySource() {
+  async function copyView() {
     try {
-      await navigator.clipboard.writeText(sourceForCopy);
+      await navigator.clipboard.writeText(visibleLines.join("\n"));
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1400);
     } catch {
@@ -62,175 +476,53 @@ export default function App() {
     }
   }
 
-  const currentFile = layers.find((item) => item.id === layer)?.file ?? "foo.unified.rs";
+  const activeLanguage = languages.find((item) => item.id === language)!;
+  const activeLayer = layerDefinitions.find((item) => item.id === layer)!;
+  const currentFile = `${activeLayer.stem}.${activeLanguage.extension}`;
 
   return (
-    <main className="workspace" aria-label="Layered Rust editor">
-      <nav className="layer-nav" aria-label="Program layers">
-        <div className="nav-heading">LAYERS</div>
-        {layers.map((item, index) => (
-          <button key={item.id} className={`layer-link ${layer === item.id ? "selected" : ""}`} aria-current={layer === item.id ? "page" : undefined} onClick={() => selectLayer(item.id)}>
-            <span className="layer-index">{String(index + 1).padStart(2, "0")}</span>
-            <span>{item.label}</span>
-          </button>
-        ))}
+    <main className="workspace" aria-label="Layered program editor">
+      <nav className="layer-nav" aria-label="Program language and layers">
+        <div className="language-picker">
+          <label className="nav-heading" htmlFor="language-select">LANGUAGE</label>
+          <select id="language-select" className="language-select" value={language} onChange={(event) => changeLanguage(event.target.value as Language)}>
+            {languages.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+          </select>
+        </div>
+        <div className="layer-list">
+          <div className="nav-heading layers-heading">LAYERS</div>
+          {layerDefinitions.map((item, index) => (
+            <button key={item.id} className={`layer-link ${layer === item.id ? "selected" : ""}`} aria-current={layer === item.id ? "page" : undefined} onClick={() => selectLayer(item.id)}>
+              <span className="layer-index">{String(index + 1).padStart(2, "0")}</span>
+              <span>{item.label}</span>
+            </button>
+          ))}
+        </div>
       </nav>
 
-      <section className="editor" aria-label={`${layers.find((item) => item.id === layer)?.label} view`}>
+      <section className="editor" aria-label={`${activeLanguage.label} ${activeLayer.label} view`}>
         <div className="editor-toolbar">
           <div className="breadcrumb"><span>semantic-demo</span><span>/</span><span>src</span><span>/</span><strong>{currentFile}</strong></div>
           <div className="toolbar-actions">
             <button className={`action-button ${tracing ? "running" : ""}`} aria-label={tracing ? "Stop trace" : "Trace execution"} title="Trace execution" onClick={() => setTracing((value) => !value)}>{tracing ? <span className="trace-pulse" /> : <Play size={13} />}</button>
-            <button className="action-button" aria-label="Copy Rust source" title={copied ? "Copied" : "Copy source"} onClick={copySource}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>
+            <button className="action-button" aria-label="Copy current view" title={copied ? "Copied" : "Copy current view"} onClick={copyView}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>
+            <a className="action-button github-link" href="https://github.com/leostera/agentml" target="_blank" rel="noreferrer" aria-label="Open the agentml GitHub repository" title="GitHub repository"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M12 .75a11.25 11.25 0 0 0-3.56 21.92c.56.1.77-.24.77-.54v-2.1c-3.14.68-3.8-1.33-3.8-1.33-.51-1.3-1.25-1.64-1.25-1.64-1.03-.7.08-.69.08-.69 1.14.08 1.74 1.17 1.74 1.17 1.02 1.74 2.67 1.24 3.32.95.1-.74.4-1.24.73-1.53-2.51-.28-5.15-1.25-5.15-5.58 0-1.23.44-2.24 1.17-3.03-.12-.29-.51-1.44.11-3 0 0 .96-.3 3.09 1.16a10.74 10.74 0 0 1 5.63 0c2.14-1.45 3.09-1.16 3.09-1.16.62 1.56.23 2.71.11 3 .73.79 1.17 1.8 1.17 3.03 0 4.34-2.65 5.3-5.17 5.57.41.35.77 1.04.77 2.1v3.08c0 .3.2.65.77.54A11.25 11.25 0 0 0 12 .75Z" /></svg></a>
           </div>
         </div>
 
         <div className="code-editor">
-          <div className="code-content">
-            {Array.from({ length: lineCount(layer) }, (_, index) => {
+          <div className={`code-content language-${language}`}>
+            {visibleLines.map((source, index) => {
               const line = index + 1;
-              return <CodeLine key={`${layer}-${line}`} line={line} selected={selectedLine === line} onClick={() => setSelectedLine(line)}>
-                {renderLine(layer, line)}
-              </CodeLine>;
+              return <button key={`${language}-${layer}-${line}`} className={`code-line ${selectedLine === line ? "selected" : ""}`} onClick={() => setSelectedLine(line)} aria-label={`Select line ${line}`}>
+                <span className="line-number">{String(line).padStart(2, "0")}</span>
+                <code>{highlight(source, language)}</code>
+              </button>;
             })}
           </div>
-          <div className="statusbar"><span><i /> {languageFor(layer)}</span><span>Ln {selectedLine}, Col 1</span><span>UTF-8</span></div>
+          <div className="statusbar"><span><i /> {activeLanguage.label} · {activeLayer.label}</span><span>Ln {selectedLine}, Col 1</span><span>UTF-8</span></div>
         </div>
       </section>
     </main>
   );
 }
-
-function CodeLine({ line, selected, children, onClick }: { line: number; selected: boolean; children: ReactNode; onClick: () => void }) {
-  return <button className={`code-line ${selected ? "selected" : ""}`} onClick={onClick} aria-label={`Select line ${line}`}>
-    <span className="line-number">{String(line).padStart(2, "0")}</span>
-    <code>{children}</code>
-  </button>;
-}
-
-function renderLine(layer: Layer, line: number) {
-  if (layer === "unified") return renderUnifiedLine(line);
-  if (layer === "code") return renderCodeLine(line);
-  if (layer === "lifetimes") return renderLifetimeLine(line);
-  if (layer === "types") return renderTypedLine(line);
-  if (layer === "invariants") return renderInvariantLine(line);
-  return renderPerformanceLine(line);
-}
-
-function renderCodeLine(line: number) {
-  switch (line) {
-    case 1: return <><Keyword>fn</Keyword> <FunctionName>rank</FunctionName>(<Parameter>query</Parameter>, <Parameter>docs</Parameter>) &#123;</>;
-    case 2: return <><Indent />let <Variable>candidates</Variable> = <Variable>docs</Variable>.<Method>iter</Method>();</>;
-    case 3: return <><Indent /><Variable>candidates</Variable>.<Method>filter</Method>(|<Parameter>doc</Parameter>| <Variable>doc</Variable>.<Method>title</Method>().<Method>contains</Method>(<Variable>query</Variable>))</>;
-    default: return <>&#125;</>;
-  }
-}
-
-function renderLifetimeLine(line: number) {
-  switch (line) {
-    case 1: return <><Keyword>fn</Keyword> <FunctionName>rank</FunctionName>&lt;<Lifetime>'query</Lifetime>, <Lifetime>'docs</Lifetime>&gt;(</>;
-    case 2: return <><Indent /><Parameter>query</Parameter>: &amp;<Lifetime>'query</Lifetime> <TypeName>str</TypeName>,</>;
-    case 3: return <><Indent /><Parameter>docs</Parameter>: &amp;<Lifetime>'docs</Lifetime> [<TypeName>Document</TypeName>],</>;
-    case 4: return <><Indent />) -&gt; <Keyword>impl</Keyword> <TypeName>Iterator</TypeName>&lt;Item = &amp;<Lifetime>'docs</Lifetime> <TypeName>Document</TypeName>&gt; + <Lifetime>'query</Lifetime> + <Lifetime>'docs</Lifetime> &#123;</>;
-    case 5: return <><Indent /><Keyword>let</Keyword> <Variable>candidates</Variable>: <TypeName>std::slice::Iter</TypeName>&lt;<Lifetime>'docs</Lifetime>, <TypeName>Document</TypeName>&gt; = <Variable>docs</Variable>.<Method>iter</Method>();</>;
-    case 6: return <><Indent /><Variable>candidates</Variable>.<Method>filter</Method>(<Keyword>move</Keyword> |<Parameter>doc</Parameter>: &amp;&amp;<Lifetime>'docs</Lifetime> <TypeName>Document</TypeName>| <Variable>doc</Variable>.<Method>title</Method>().<Method>contains</Method>(<Variable>query</Variable>))</>;
-    default: return <>&#125;</>;
-  }
-}
-
-function renderTypedLine(line: number) {
-  switch (line) {
-    case 1: return <><Keyword>type</Keyword> <TypeName>DocumentRef</TypeName> = &amp;<TypeName>Document</TypeName></>;
-    case 2: return <><Keyword>fn</Keyword> <FunctionName>rank</FunctionName>(<Parameter>query</Parameter>: &amp;<TypeName>str</TypeName>, <Parameter>docs</Parameter>: &amp;[<TypeName>Document</TypeName>]) -&gt; <TypeName>Iterator</TypeName>&lt;<TypeName>DocumentRef</TypeName>&gt;</>;
-    case 3: return <><Keyword>let</Keyword> <Variable>candidates</Variable>: <TypeName>Iter</TypeName>&lt;<TypeName>DocumentRef</TypeName>&gt; = <Method>iter</Method>(<Variable>docs</Variable>)</>;
-    case 4: return <><Keyword>let</Keyword> <Variable>predicate</Variable>: <TypeName>DocumentRef</TypeName> → <TypeName>bool</TypeName> = <Method>matches_title</Method>(<Variable>query</Variable>)</>;
-    case 5: return <><Keyword>let</Keyword> <Variable>matching</Variable>: <TypeName>Filter</TypeName>&lt;<TypeName>Iter</TypeName>&lt;<TypeName>DocumentRef</TypeName>&gt;, <TypeName>Fn</TypeName>&lt;<TypeName>DocumentRef</TypeName>, <TypeName>bool</TypeName>&gt;&gt; = <Method>filter</Method>(<Variable>candidates</Variable>, <Variable>predicate</Variable>)</>;
-    default: return <><Keyword>return</Keyword> <Variable>matching</Variable></>;
-  }
-}
-
-function renderInvariantLine(line: number) {
-  switch (line) {
-    case 1: return <><Invariant>invariant</Invariant> <TypeName>rank</TypeName> &#123;</>;
-    case 2: return <><Indent /><Invariant>arity</Invariant>(rank) == <NumberToken>2</NumberToken></>;
-    case 3: return <><Indent /><Invariant>result</Invariant>(rank, query, docs) ⊆ docs</>;
-    case 4: return <><Indent />∀ doc ∈ result: <Invariant>matches</Invariant>(doc.title, query)</>;
-    case 5: return <><Indent /><Invariant>order</Invariant>(result) = <Invariant>order</Invariant>(docs filtered by query)</>;
-    case 6: return <>&#125;</>;
-    case 7: return <><Invariant>invariant</Invariant> <TypeName>query</TypeName> &#123;</>;
-    case 8: return <><Indent /><Invariant>immutable</Invariant>(query)</>;
-    case 9: return <><Indent /><Invariant>value_after</Invariant>(rank, query) = <Invariant>value_before</Invariant>(rank, query)</>;
-    case 10: return <>&#125;</>;
-    case 11: return <><Invariant>invariant</Invariant> <TypeName>candidates</TypeName> &#123;</>;
-    case 12: return <><Indent /><Invariant>count</Invariant>(candidates) = <Invariant>count</Invariant>(docs) ∧ <Invariant>order</Invariant>(candidates) = <Invariant>order</Invariant>(docs)</>;
-    case 13: return <><Indent /><Invariant>elements</Invariant>(candidates) ⊆ docs</>;
-    default: return <>&#125;</>;
-  }
-}
-
-function renderPerformanceLine(line: number) {
-  switch (line) {
-    case 1: return <><Plan>plan</Plan> <TypeName>rank</TypeName> &#123;</>;
-    case 2: return <><Indent /><Property>inline</Property>(<FunctionName>rank</FunctionName>) = <Value>auto</Value></>;
-    case 3: return <><Indent /><Property>return</Property> = <Value>lazy_iterator</Value></>;
-    case 4: return <><Indent /><Property>heap_allocations</Property> = <NumberToken>0</NumberToken></>;
-    case 5: return <>&#125;</>;
-    case 6: return <><Plan>plan</Plan> <TypeName>candidates</TypeName> &#123;</>;
-    case 7: return <><Indent /><Property>representation</Property> = <Value>slice_iterator</Value></>;
-    case 8: return <><Indent /><Property>copies_per_item</Property> = <NumberToken>0</NumberToken></>;
-    case 9: return <><Indent /><Property>padding</Property>(<Variable>candidates</Variable>) = <Value>none</Value></>;
-    case 10: return <>&#125;</>;
-    case 11: return <><Plan>plan</Plan> <TypeName>matching</TypeName> &#123;</>;
-    case 12: return <><Indent /><Property>evaluation</Property> = <Value>on_consume</Value></>;
-    case 13: return <><Indent /><Property>materialize</Property> = <Value>false</Value></>;
-    default: return <>&#125;</>;
-  }
-}
-
-function renderUnifiedLine(line: number) {
-  switch (line) {
-    case 1: return <><span className="syntax-attribute">#[perf</span>(<Property>inline</Property>(<FunctionName>rank</FunctionName>) = <Value>auto</Value>, <Property>heap_allocations</Property> = <NumberToken>0</NumberToken>, <Property>evaluation</Property> = <Value>lazy</Value>)<span className="syntax-attribute">]</span></>;
-    case 2: return <><span className="syntax-attribute">#[perf</span>(<Property>materialize</Property> = <Value>false</Value>, <Property>padding</Property>(<Variable>candidates</Variable>) = <Value>none</Value>, <Property>copies_per_item</Property> = <NumberToken>0</NumberToken>)<span className="syntax-attribute">]</span></>;
-    case 3: return <><Keyword>type</Keyword> <TypeName>Predicate</TypeName>&lt;<Lifetime>'query</Lifetime>, <Lifetime>'docs</Lifetime>&gt; = <TypeName>FnMut</TypeName>(&amp;&amp;<Lifetime>'docs</Lifetime> <TypeName>Document</TypeName>) -&gt; <TypeName>bool</TypeName> + <Lifetime>'query</Lifetime>;</>;
-    case 4: return <><Keyword>fn</Keyword> <FunctionName>rank</FunctionName>&lt;<Lifetime>'query</Lifetime>, <Lifetime>'docs</Lifetime>&gt;(</>;
-    case 5: return <><Indent /><Keyword>immutable</Keyword> <Parameter>query</Parameter>: &amp;<Lifetime>'query</Lifetime> <TypeName>str</TypeName>,</>;
-    case 6: return <><Indent /><Parameter>docs</Parameter>: &amp;<Lifetime>'docs</Lifetime> [<TypeName>Document</TypeName>],</>;
-    case 7: return <><Indent />) -&gt; <Keyword>impl</Keyword> <TypeName>Iterator</TypeName>&lt;Item = &amp;<Lifetime>'docs</Lifetime> <TypeName>Document</TypeName>&gt; + <Lifetime>'query</Lifetime> + <Lifetime>'docs</Lifetime></>;
-    case 8: return <><Keyword>ensures</Keyword> &#123;</>;
-    case 9: return <><Indent /><Invariant>arity</Invariant>(<FunctionName>rank</FunctionName>) = <NumberToken>2</NumberToken>;</>;
-    case 10: return <><Indent /><Invariant>result</Invariant> ⊆ <Variable>docs</Variable>;</>;
-    case 11: return <><Indent /><Invariant>matches_all</Invariant>(<Invariant>result</Invariant>, <Variable>query</Variable>);</>;
-    case 12: return <><Indent /><Invariant>preserves_order</Invariant>(<Invariant>result</Invariant>, <Variable>docs</Variable>);</>;
-    case 13: return <><Indent /><Invariant>value_after</Invariant>(<Variable>query</Variable>) = <Invariant>value_before</Invariant>(<Variable>query</Variable>);</>;
-    case 14: return <>&#125;</>;
-    case 15: return <>&#123;</>;
-    case 16: return <><Indent /><Keyword>let</Keyword> <Variable>candidates</Variable>: <TypeName>Iter</TypeName>&lt;<Lifetime>'docs</Lifetime>, <TypeName>Document</TypeName>&gt; = <Variable>docs</Variable>.<Method>iter</Method>();</>;
-    case 17: return <><Indent /><Keyword>invariant</Keyword> &#123;</>;
-    case 18: return <><Indent level={2} /><Invariant>count</Invariant>(<Variable>candidates</Variable>) = <Invariant>count</Invariant>(<Variable>docs</Variable>);</>;
-    case 19: return <><Indent level={2} /><Invariant>order</Invariant>(<Variable>candidates</Variable>) = <Invariant>order</Invariant>(<Variable>docs</Variable>);</>;
-    case 20: return <><Indent level={2} /><Invariant>elements</Invariant>(<Variable>candidates</Variable>) ⊆ <Variable>docs</Variable>;</>;
-    case 21: return <><Indent />&#125;;</>;
-    case 22: return <><Indent /><Keyword>let</Keyword> <Variable>matching</Variable>: <TypeName>Filter</TypeName>&lt;</>;
-    case 23: return <><Indent level={2} /><TypeName>Iter</TypeName>&lt;<Lifetime>'docs</Lifetime>, <TypeName>Document</TypeName>&gt;,</>;
-    case 24: return <><Indent level={2} /><TypeName>Predicate</TypeName>&lt;<Lifetime>'query</Lifetime>, <Lifetime>'docs</Lifetime>&gt;</>;
-    case 25: return <><Indent />&gt; = <Variable>candidates</Variable>.<Method>filter</Method>(<Keyword>move</Keyword> |<Parameter>doc</Parameter>: &amp;&amp;<Lifetime>'docs</Lifetime> <TypeName>Document</TypeName>| -&gt; <TypeName>bool</TypeName> &#123;</>;
-    case 26: return <><Indent level={2} /><Variable>doc</Variable>.<Method>title</Method>().<Method>contains</Method>(<Variable>query</Variable>)</>;
-    case 27: return <><Indent />&#125;);</>;
-    case 28: return <><Indent /><Variable>matching</Variable></>;
-    default: return <>&#125;</>;
-  }
-}
-
-function Keyword({ children }: { children: ReactNode }) { return <span className="syntax-keyword">{children}</span>; }
-function FunctionName({ children }: { children: ReactNode }) { return <span className="syntax-function">{children}</span>; }
-function Parameter({ children }: { children: ReactNode }) { return <span className="syntax-parameter">{children}</span>; }
-function Variable({ children }: { children: ReactNode }) { return <span className="syntax-variable">{children}</span>; }
-function Method({ children }: { children: ReactNode }) { return <span className="syntax-method">{children}</span>; }
-function TypeName({ children }: { children: ReactNode }) { return <span className="syntax-type">{children}</span>; }
-function Lifetime({ children }: { children: ReactNode }) { return <span className="syntax-lifetime">{children}</span>; }
-function Invariant({ children }: { children: ReactNode }) { return <span className="syntax-invariant">{children}</span>; }
-function Plan({ children }: { children: ReactNode }) { return <span className="syntax-invariant">{children}</span>; }
-function Property({ children }: { children: ReactNode }) { return <span className="syntax-property">{children}</span>; }
-function Value({ children }: { children: ReactNode }) { return <span className="syntax-value">{children}</span>; }
-function NumberToken({ children }: { children: ReactNode }) { return <span className="syntax-number">{children}</span>; }
-function Indent({ level = 1 }: { level?: number }) { return <span className="indent" aria-hidden="true" style={{ width: `${level * 4}ch` }} />; }
